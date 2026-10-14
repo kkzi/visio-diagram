@@ -38,6 +38,26 @@ Verify the environment:
 python -c "import sys; sys.path.insert(0,'scripts'); import visio_lib; visio_lib.check_env()"
 ```
 
+## Install as an LLM agent skill
+
+The repo is a standard skill package (`SKILL.md` + `scripts/` + `references/`). Clone it into any agent's skill directory and the agent can drive the full workflow autonomously:
+
+```bash
+# WorkBuddy (user-level)
+git clone https://github.com/kkzi/visio-diagram.git ~/.workbuddy-ai/skills/visio-diagram
+
+# Claude Code
+git clone https://github.com/kkzi/visio-diagram.git ~/.claude/skills/visio-diagram
+```
+
+Example prompt that triggers the skill:
+
+```
+用 Visio 画一张三泳道的系统架构图，按文档栏宽 1:1 出图，自检后嵌到方案 docx 里
+```
+
+The agent then runs the workflow itself: environment check → column-width measurement → drawing script → overflow self-check → alignment audit → export and Word embedding. The host machine needs the same requirements as above; the agent only needs shell access.
+
 ## Usage
 
 ```python

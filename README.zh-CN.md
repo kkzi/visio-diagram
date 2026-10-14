@@ -38,6 +38,26 @@ pip install pywin32 pillow
 python -c "import sys; sys.path.insert(0,'scripts'); import visio_lib; visio_lib.check_env()"
 ```
 
+## 作为 LLM agent 技能安装
+
+本仓库即标准技能包（`SKILL.md` + `scripts/` + `references/`）。克隆到 agent 的技能目录后，agent 即可自主驱动完整工作流：
+
+```bash
+# WorkBuddy（用户级）
+git clone https://github.com/kkzi/visio-diagram.git ~/.workbuddy-ai/skills/visio-diagram
+
+# Claude Code
+git clone https://github.com/kkzi/visio-diagram.git ~/.claude/skills/visio-diagram
+```
+
+触发技能的示例指令：
+
+```
+用 Visio 画一张三泳道的系统架构图，按文档栏宽 1:1 出图，自检后嵌到方案 docx 里
+```
+
+agent 会自行完成：环境检查 → 量栏宽 → 写绘图脚本 → 溢出自检 → 对齐审计 → 出图并嵌入 Word。宿主机环境要求同上；agent 只需能执行 shell 命令。
+
 ## 使用
 
 ```python
