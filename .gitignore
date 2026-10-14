@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+
+# 运行时状态：audit_align --add 的白名单属各项目本地数据，不入库
+scripts/audit_whitelist.json
+
+# 示例产物
+out/
