@@ -15,6 +15,8 @@
   G 图例**不越界**          → legend() 按 w 均布、整行不超画布   （§22）
   H 标签**贴线**（显式）    → 文字中心落在线上 ~gap 处、可换侧  （§23）
   I 标签**贴线**（并入）    → 摆在线上方 5mm 的文本框被收进 ~2.3mm（§23）
+  J 连线**出线方向**自检    → 目标在右却从左边出线，必须报出     （§24）
+  K 合法**绕行**不误报      → 先向左绕再回头接右边，不报          （§24）
 
 用法：
     python scripts/selftest.py            # 在临时目录里跑，跑完自动清理
@@ -249,6 +251,39 @@ def main():
               tgt is not None and abs(tgt[0] - 60) < 0.6 and abs(tgt[1] - exp_y) < 0.6,
               "中心=%s 期望≈(60, %.2f)"
               % ("未并入" if tgt is None else "%.2f,%.2f" % tgt, exp_y))
+
+        # J 连线方向自检（§24）：目标在**右**，却从 a 的**左边**出线
+        #   → connect() 当场记一条 warn；audit_links() 还应报「穿入 a 内部」
+        d5 = VDraw(160, 60)
+        instances.append(d5)
+        a5 = d5.rect(6, 10, 40, 22, fill="white")
+        b5 = d5.rect(100, 10, 40, 22, fill="white")
+        ca5 = d5.side_cps(a5, "left right")
+        cb5 = d5.side_cps(b5, "left")
+        d5.connect(a5, ca5["left"], b5, cb5["left"])
+        w5 = list(d5._link_warns)
+        cross5 = d5.audit_links(verbose=False)
+        safe_close()
+        instances.clear()
+        check("J 错误出线被检出", len(w5) == 1 and "left" in w5[0],
+              "warn=%d %s" % (len(w5), (w5[0][:24] + "…") if w5 else ""))
+        check("J 同时报穿越实体框", len(cross5) >= 1, "cross=%d" % len(cross5))
+
+        # K 合法绕行：从左边出线、先向左绕再回头 → **不应**误报（§24）
+        d6 = VDraw(160, 60)
+        instances.append(d6)
+        a6 = d6.rect(6, 20, 40, 22, fill="white")     # y 20~42
+        b6 = d6.rect(100, 10, 40, 22, fill="white")   # y 10~32
+        ca6 = d6.side_cps(a6, "left")
+        cb6 = d6.side_cps(b6, "left")
+        d6.connect(a6, ca6["left"], b6, cb6["left"],
+                   via=[(2, 31), (2, 16), (100, 16), (100, 21)])
+        w6 = list(d6._link_warns)
+        cross6 = d6.audit_links(verbose=False)
+        safe_close()
+        instances.clear()
+        check("K 合法绕行不误报", not w6 and not cross6,
+              "warn=%d cross=%d" % (len(w6), len(cross6)))
 
     except Exception:
         import traceback

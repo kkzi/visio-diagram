@@ -235,6 +235,8 @@ class VDraw(object):
         self.pg = self.doc.Pages.Item(1)
         self._texts = []
         self._n_dyn = 0                         # 动态路由连接线计数
+        self._cps = {}                          # (形状ID, 行号) -> (fx, fy)，供出线方向自检
+        self._link_warns = []                   # 连线方向/穿越自检发现的问题
         self._merged = False                    # merge_texts() 幂等标记
         self._merged_stat = None
         # save()/export() 前自动并入文字（可用环境变量 VISIO_MERGE=0 关闭，
@@ -347,6 +349,21 @@ class VDraw(object):
     #   （竖线从「上框顶边」贯穿到「下框底边」）。DirX/DirY 同为局部坐标：+Y 向上。
     _SIDE_CP = {"top": (0.5, 0.0, 0, 1), "bottom": (0.5, 1.0, 0, -1),
                 "left": (0.0, 0.5, -1, 0), "right": (1.0, 0.5, 1, 0)}
+    # 四向中点的朝外法线（本库页坐标：Y 向下）——出线方向自检用
+    _SIDE_N = {"left": (-1, 0), "right": (1, 0), "top": (0, -1), "bottom": (0, 1)}
+
+    @classmethod
+    def _cp_side(cls, fx, fy):
+        """连接点比例 (fx,fy) → 'left'/'right'/'top'/'bottom'；非四向中点返回 None。"""
+        if abs(fx) < 1e-6:
+            return "left"
+        if abs(fx - 1.0) < 1e-6:
+            return "right"
+        if abs(fy) < 1e-6:
+            return "top"
+        if abs(fy - 1.0) < 1e-6:
+            return "bottom"
+        return None
 
     def add_cp(self, s, fx=0.5, fy=0.5, dirx=0, diry=0):
         """给形状加一个连接点，位置 = 形状外框比例 (fx·Width, fy·Height)。
@@ -369,6 +386,11 @@ class VDraw(object):
                 s.CellsSRC(7, row, 3).FormulaU = "%g" % float(diry)
             except Exception:
                 pass
+        # 记下 (fx, fy)，供 connect() 的「出线方向自检」判断这一端朝哪侧
+        try:
+            self._cps[(s.ID, row)] = (float(fx), float(fy))
+        except Exception:
+            pass
         return row
 
     def side_cps(self, s, sides="top bottom left right"):
@@ -463,7 +485,56 @@ class VDraw(object):
                                  align=label_align, pos=label_pos,
                                  at=label_at, gap=label_gap,
                                  side=label_side)
+        self._check_end_dirs(c, sa, ia, sb, ib, via)
         return c
+
+    def _check_end_dirs(self, c, sa, ia, sb, ib, via):
+        """端点出线方向自检：**不得从所胶连接点的反方向出发**。
+
+        ★ 为什么必须查（2026-10-17 项目实测）：`connect(a, cp["left"], b, cp["left"])`
+          这种写法在 b 位于 a 右侧时，连线会从 a 的**左边**出发横穿整个 a。
+          a 有底色 → 线被压在框下面、只在缺口露一截，成品看着像「从框左边划过来」，
+          肉眼很难发现，源脚本也读不出错。
+        判据：该端连接点的朝外法线 · 首段方向 < 0 → 首段指向框内，必穿框。
+        只查**四向中点**（自定义连接点位置无「朝向」语义，跳过）；自由点/中心胶水跳过。
+        """
+        try:
+            bx = c.CellsU("BeginX").Result("mm")
+            by = c.CellsU("BeginY").Result("mm")
+            ex = c.CellsU("EndX").Result("mm")
+            ey = c.CellsU("EndY").Result("mm")
+        except Exception:
+            return
+        # ★ 一律换成本库页坐标（左上原点、Y 向下）再比对：_SIDE_N 用的就是这套
+        #   （BeginY/EndY 是 Visio 的 Y 向上坐标，直接用会让上下两侧的正负号反掉）
+        pts = [(bx, self.H - by)]
+        if via:
+            pts += [(p[0], p[1]) for p in via[1:-1]]
+        pts.append((ex, self.H - ey))
+        if len(pts) < 2:
+            return
+        for tag, shp, idx, p0, p1 in (("Begin", sa, ia, pts[0], pts[1]),
+                                      ("End", sb, ib, pts[-1], pts[-2])):
+            if not isinstance(idx, int):
+                continue
+            info = self._cps.get((shp.ID, idx))
+            if not info:
+                continue
+            side = self._cp_side(*info)
+            if not side:
+                continue
+            dx, dy = p1[0] - p0[0], p1[1] - p0[1]
+            L = (dx * dx + dy * dy) ** 0.5
+            if L < 1e-6:
+                continue
+            nrm = self._SIDE_N[side]
+            if (dx * nrm[0] + dy * nrm[1]) / L >= -0.5:
+                continue
+            msg = ("[连线方向] %s 端胶在形状#%s 的 %s 侧，首段却朝反方向 → 连线会横穿该形状。"
+                   "改用朝向目标的那一侧（例：connect(a, cp[\"right\"], b, cp[\"left\"])）。"
+                   % (tag, shp.ID, side))
+            print("  " + msg)
+            self._link_warns.append(msg)
 
     @staticmethod
     def _glue(conn, cell, shp, target):
@@ -1334,7 +1405,7 @@ class VDraw(object):
         return bad
 
     def check(self, verbose=True):
-        """打印文字溢出自检结果。返回溢出清单（空列表 = 通过）。"""
+        """打印文字溢出自检 + 连线自检结果。返回溢出清单（空列表 = 通过）。"""
         bad = self.report()
         if verbose:
             if bad:
@@ -1344,4 +1415,124 @@ class VDraw(object):
                           % (t, sz, w, h, ln, need))
             else:
                 print("  [文字溢出] 无")
+        cross = self.audit_links()
+        if verbose:
+            n1, n2 = len(self._link_warns), len(cross)
+            if n1 or n2:
+                print("  [连线自检] 出线方向 %d 处 ｜ 穿越实体框 %d 处（详见上方逐条提示）"
+                      % (n1, n2))
+            else:
+                print("  [连线自检] 出线方向 / 穿越实体框 均无")
+        return bad
+
+    # ---------------------------------------------------------- 连线审计
+    def _page_boxes(self):
+        """页面上所有 2-D 实体框：[(ID, (x0,y0,x1,y1) 页坐标mm, FillPattern)]。"""
+        out = []
+        try:
+            n = self.pg.Shapes.Count
+        except Exception:
+            return out
+        for i in range(1, n + 1):
+            try:
+                s = self.pg.Shapes.Item(i)
+                if s.OneD:
+                    continue
+                w = s.CellsU("Width").Result("mm")
+                h = s.CellsU("Height").Result("mm")
+                if w <= 1 or h <= 1:
+                    continue
+                x0 = s.CellsU("PinX").Result("mm") - s.CellsU("LocPinX").Result("mm")
+                y1 = self.H - (s.CellsU("PinY").Result("mm") - s.CellsU("LocPinY").Result("mm"))
+                # ★ 必须用 .Result(0)（visNone，取内部值）：传 "INT" 会报
+                #   「Bad measurement unit.」→ 异常被吞 → 整个框被跳过、审计恒 0。
+                fill = int(s.CellsU("FillPattern").Result(0))
+                out.append((s.ID, (x0, y1 - h, x0 + w, y1), fill))
+            except Exception:
+                continue
+        return out
+
+    def _page_lines(self):
+        """页面上所有 1-D 形状的折线点（页坐标 mm、Y 向下）。"""
+        out = []
+        try:
+            n = self.pg.Shapes.Count
+        except Exception:
+            return out
+        for i in range(1, n + 1):
+            try:
+                s = self.pg.Shapes.Item(i)
+                if not s.OneD:
+                    continue
+                ox = s.CellsU("PinX").Result("mm") - s.CellsU("LocPinX").Result("mm")
+                oy = s.CellsU("PinY").Result("mm") - s.CellsU("LocPinY").Result("mm")
+                k = s.RowCount(GEOM_SEC) - 1
+                pts = [(ox + s.CellsU("Geometry1.X%d" % (j + 1)).Result("mm"),
+                        self.H - (oy + s.CellsU("Geometry1.Y%d" % (j + 1)).Result("mm")))
+                       for j in range(k)]
+                if len(pts) >= 2:
+                    out.append((s.ID, pts))
+            except Exception:
+                continue
+        return out
+
+    @staticmethod
+    def _seg_hits_rect(p, q, r, pad=0.25):
+        """线段 pq 是否穿入矩形 r 的**内部**（Liang-Barsky，pad 收边 → 贴边不算）。"""
+        x0, y0, x1, y1 = r[0] + pad, r[1] + pad, r[2] - pad, r[3] - pad
+        if x1 <= x0 or y1 <= y0:
+            return False
+        dx, dy = q[0] - p[0], q[1] - p[1]
+        t0, t1 = 0.0, 1.0
+        for pp, qq in ((-dx, p[0] - x0), (dx, x1 - p[0]), (-dy, p[1] - y0), (dy, y1 - p[1])):
+            if abs(pp) < 1e-12:
+                if qq < 0:
+                    return False
+            else:
+                t = qq / pp
+                if pp < 0:
+                    t0 = max(t0, t)
+                else:
+                    t1 = min(t1, t)
+                if t0 > t1:
+                    return False
+        return t1 - t0 > 1e-9
+
+    def audit_links(self, verbose=True):
+        """整页连线审计：折线是否**穿入某个有底色实体框**内部。
+
+        ★ 排除两类「穿过去也正常」的框：
+          · 容器（泳道 / 系统边界框）——内部含 ≥2 个其它框的中心；
+          · 无底色文本框（FillPattern=0）——通栏标题框，线从空白处经过不压字。
+        返回问题清单；同时把「出线方向」的问题（connect() 时已记）一并打印。
+        """
+        boxes = self._page_boxes()
+        page_area = max(1.0, self.W * self.H)
+        kids = {}
+        for bid, r, _f in boxes:
+            # 子框只数「有底色」的：step_box 内部还有 1~2 个无底色文字框（保存前未 merge），
+            # 若一并计数，每个 step_box 都会被误判成容器而漏查。
+            kids[bid] = sum(1 for oid, o, g in boxes if oid != bid and g != 0 and
+                            r[0] <= (o[0] + o[2]) / 2 <= r[2] and
+                            r[1] <= (o[1] + o[3]) / 2 <= r[3])
+        solid = []
+        for bid, r, f in boxes:
+            if f == 0:
+                continue                           # 无底色文本框：线从空白处过不压字
+            area = (r[2] - r[0]) * (r[3] - r[1])
+            # 容器 = 大面积（≥18% 页面积，泳道/系统边界框）或内含 ≥2 个实体子框
+            if area >= 0.18 * page_area or kids[bid] >= 2:
+                continue
+            solid.append((bid, r))
+        bad = []
+        for lid, pts in self._page_lines():
+            for bid, r in solid:
+                if all(r[0] <= p[0] <= r[2] and r[1] <= p[1] <= r[3] for p in pts):
+                    continue                       # 容器：整条线都在里面
+                if any(self._seg_hits_rect(p, q, r) for p, q in zip(pts[:-1], pts[1:])):
+                    msg = "[连线穿越] 线#%s 穿入 形状#%s（%.0f×%.0f @%.1f,%.1f）内部" % (
+                        lid, bid, r[2] - r[0], r[3] - r[1], r[0], r[1])
+                    if verbose:
+                        print("  " + msg)
+                    bad.append(msg)
         return bad
