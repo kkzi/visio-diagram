@@ -980,3 +980,199 @@ d.connect(box["cmp"], cp["cmp"]["left"], box["rep"], cp["rep"]["left"])   # ✗
 
 **本项目全量结果**：15 张图 2 处（图 8-1「比对→报表」、图N11「记录框」），其余 13 张 0 处；
 修完 `d.check()` 恒为「均无」。
+
+---
+
+## 25. ★★★ 图「变扁 / 比例不对」—— 先做三方对照，再决定改谁（2026-10-19 实坑，25 个对象）
+
+**症状**：文档里的图整体被压扁（或拉长），方框明显不是正方形，类图里的字横向拉宽。
+肉眼判断「比例不对」很容易，但**改错地方会把图彻底改坏**（§9、§13 都证明了：动 EMF `frame` 会整体放大裁剪）。
+
+**先认清三个「比例」**：
+
+| 名字 | 来源 | 说明 |
+|---|---|---|
+| 显示框比 `dr` | docx 里 `<wp:extent cx cy>`（EMU）/ `<v:shape style="width:..pt;height:..pt">` | Word 排版按它出图 |
+| bounds 比 `br` | EMF 头偏移 8 的 `rclBounds`（4×int32，设备单位） | EMF 内容的真实包围盒 |
+| vsdx 比 `vr` | `visio/pages/page1.xml` 各 Shape 的 `PinX/PinY/Width/Height` 并集（**英寸**） | 设计真值 |
+
+> ★ vsdx 里 `Cell` 的 `V` 一律是**内部英寸**，`U='MM'` 只是显示单位（§24 也提过）。
+
+**判据（决策树，别套常数）**：
+
+```
+e_b = |br/vr - 1|      # bounds 与设计真值的偏差
+e_d = |dr/vr - 1|      # 显示框与设计真值的偏差
+
+e_b ≤ 3%                → bounds 可信
+   └ e_d > 3%           → 【显示框写错了】只改显示框：H = W / br
+e_b > 3% 且 e_d ≤ 3%    → 【EMF 本身被改过】不要动 frame，重新导出 EMF
+e_b > 3% 且 e_d > 3%    → 【都偏】仍按「动 docx 不动 EMF」：H = W / br
+```
+
+**本项目实测**（2026-10-19，108 图 / 70 个 OLE 对象）：
+
+- 25 个对象 `e_d` 恒 ≈ 48%、`e_b` ≈ 0~3% → **全部是显示框写错**，且 `dr = br × 0.52`（1/1.914）。
+- 稳定倍率的根因：**EMF `frame` 的 X/Y 两向 DPI 不一致**（实测 48.6 dpi vs 25.4 dpi）。`frame` 宽度被压
+  1.914 倍，谁拿 `frame` 去算显示框，就得到 0.52× 的假比例。
+- ★ **0.52 不是普适常数**，只说明「这批文件的显示框是照 frame 宽度算的」。永远用上面的三方对照，
+  不要记住某个倍率然后到处套。
+- 修完复验：108 图 `e_d` 全部 ≤1.5%（残余 1.7%~3.4% 的 12 张类图再按 `H = W/br` 精修一遍收敛）。
+
+**批量改显示框：三处都要写，缺一处就会被 Word 用旧值重排**：
+
+```python
+p = re.sub(r'<wp:extent cx="\d+" cy="\d+"',
+           f'<wp:extent cx="{int(W*12700)}" cy="{int(H*12700)}"', p)   # EMU = 1/12700 pt
+p = re.sub(r'<a:ext cx="\d+" cy="\d+"',
+           f'<a:ext cx="{int(W*12700)}" cy="{int(H*12700)}"', p)
+p = re.sub(r'style="width:[\d.]+pt;height:[\d.]+pt"',
+           f'style="width:{W:.1f}pt;height:{H:.1f}pt"', p)
+```
+
+- 老式 VML 图（`<w:object>` + `<v:shape>`）：**只有 style，没有 extent**；
+- DrawingML 图（`<pic:pic>`）：只有 `extent` / `a:ext`；
+- OLE 对象两种结构都会出现，按 rId 定位到段落就一起改。
+
+**「太小」的另一半问题**：显示框比对了，但宽度只占栏宽 54%。定宽规则：
+
+```python
+W = max(当前宽, min(设计宽mm * 2.83465, 栏宽))   # 2.83465 = pt/mm
+H = W / br
+if H > 600:            # 超页高的图按高回缩
+    H = 600; W = H * br
+```
+
+---
+
+## 26. ★★ Word 保存会把 `72.0pt` 规范化成 `1in` —— 解析 VML style 必须支持三种单位（2026-10-19 实坑）
+
+**症状**：脚本写入 `style="width:340pt;height:72.2pt"`，Word 打开保存一次后变成
+`style="width:340pt;height:1in"`。审计脚本用 `height:([\d.]+)pt` 去解析 → 拿到 0 →
+报表上出现「显示框 340x**0**」「长宽比 −100%」的假告警，看起来像文档被改坏了。
+
+**根因**：Word 序列化 VML 时会挑「最简单位」—— 整 72pt 写 `1in`，整 1in 也可能是 `72pt`；
+`mm`/`cm` 同理。这不是损坏，是正常的单位归一化。
+
+**修法**：解析一律做单位换算，不要写死 `pt`：
+
+```python
+def to_pt(v):
+    m = re.match(r'([\d.]+)(pt|in|mm|cm)?', v)
+    if not m:
+        return 0.0
+    x, u = float(m.group(1)), (m.group(2) or 'pt')
+    return x * {'pt': 1.0, 'in': 72.0, 'mm': 2.83465, 'cm': 28.3465}[u]
+
+wm = re.search(r'width:([\d.]+(?:pt|in|mm|cm)?)', style)
+hm = re.search(r'height:([\d.]+(?:pt|in|mm|cm)?)', style)
+dw, dh = to_pt(wm.group(1)), to_pt(hm.group(1))
+```
+
+**连带教训**：
+- 同一个「写 72.2pt → 读回 1in」会让**阈值判定反复横跳**：写 72.2 读回 72.0，偏差 0.3%，
+  属于正常容差，不要为了"对齐到小数点"反复重写，写一次就够。
+- 定位图段落用 **rId → 段落**，不要用「第 N 个图片段落」的下标（一改内容就错位）。
+- 改完必须**重新导出 PDF 复核**（Word 的归一化只在保存后生效，静态查 XML 看不出来）。
+
+---
+
+## 27. ★★★ 静态 EMF 图（无 vsdx 源）文字被裁 —— 只能整张重绘，别指望自动检测（2026-10-19 实坑）
+
+**症状**：图里某个框的标题少一个字（「规划任务数据处理」显示成「划任务数据处理」），
+或者框内第三行文字压在框线上、被切掉半截。原图是别人早期导出的 EMF 图片，docx 里没有 vsdx 源。
+
+**为什么不能"改一下"**：EMF 里的文字是**矢量轮廓/嵌入字形**，不是可编辑文本：
+
+- PyMuPDF 在 PDF 里**提取不到**这些文字的 span（实测：含图那一页 `get_text()` 只返回正文和题注，
+  图内文字一个字都没有）→ 「在 PDF 里判断文字是否越出框」这条路直接不通。
+- PIL 字体度量法（`§3`）在这类图上**阈值极不稳定**：行高系数 1.30 + 全边距时命中 19 处，
+  改成 1.20 + 半边距时命中 0 处，同一批图结论翻转 → **不能作为判据**。
+- 只能**逐张裁图目检**。裁图方法：按题注 y 区间取 `page.get_drawings()` 的并集包围盒，
+  裁完拼成联系表（每张 4~6 个，DPI ≥240）一次性看。
+
+**修法 = 重画 + 整张替换**：
+
+1. 照原图重画（`visio_lib` 正常流程），框宽按**最长文案**配足，别按"看起来差不多"的宽度画。
+   画完必须 `d.check()` 到 `[文字溢出] 无`（它会按 PIL 度量报"框高/框宽装不下"）。
+   ★ 但 `d.check()` 通过 ≠ 一定不溢出：它只算文本框尺寸，管不到"字号大于框"这种源图设计问题，
+   所以重画时**框高要给足**（本项目 `box()` 的 body 区 = `h - 8.6`，2 行正文建议 `h ≥ 17~19mm`）。
+2. 用 EMF 的 **bounds 比**重设显示框（§25），不要用画布比：
+
+```python
+b = open(new_emf, 'rb').read()
+bd = struct.unpack('<4i', b[8:24])
+ratio = (bd[2] - bd[0]) / (bd[3] - bd[1])
+H = W / ratio            # W 沿用原图宽度（或按上条定宽规则）
+# 画布 146x68mm 却按画布比算 H，会得到 -6.9% 的偏差 ← 本项目实坑
+```
+
+3. 写回 docx：`zipfile` 只替换 `word/media/<该图>.emf` + `word/document.xml`，其余条目**按字节原样复制**
+   （OLE 与其它 EMF 零风险）。
+
+**验收**：重新导 PDF，裁该图放大目检（300~400 dpi），确认①文字全在框内 ②长宽比 ≤1.5% ③居中 ≤1pt。
+
+**本项目结果**：22 个「frame≠bounds」对象被怀疑文字溢出，逐张目检后**只有 1 张真有问题**，
+其余 21 张正常（类图右侧本就留白，没有溢出风险）。
+→ ★ **从 `frame≠bounds` 推出来的缺陷清单是假设，不是结论；必须先目检再报数。**
+
+---
+
+## 28. ★★ 两个「测量方法本身有坑」的验收项：居中、目录页码（2026-10-19 实坑）
+
+### 28.1 测图是否居中：别用 `Range.Information`
+
+```python
+sh.InlineShapes(i).Range.Information(5)   # wdHorizontalPositionRelativeToPage
+# ✗ 108 个图形全部返回 89.8pt（= 段落左边距），完全不分位置
+```
+
+**正解 = PDF 矢量路径法**：EMF 在 PDF 里回放成矢量 path，取 `page.get_drawings()` 里
+**正常尺寸** path 的并集包围盒，与栏中心比：
+
+```python
+rects = []
+for dr in page.get_drawings():
+    r = dr['rect']
+    if r.width <= 0.5 and r.height <= 0.5:      # 排除点/短线
+        continue
+    if r.width > COLW * 1.06 or r.x0 < col0 - 30 or r.x1 > col1 + 30:
+        continue                                 # ★ 排除 EMF 的超大裁剪框
+    rects.append(r)
+
+# 按题注切 y 区间，只取「上一题注之后、本题注之前」的 path
+cand = [r for r in rects if r.y0 >= low - 2 and r.y1 <= cap.y0 + 3]
+x0, x1 = min(r.x0 for r in cand), max(r.x1 for r in cand)
+offset = (x0 + x1) / 2 - (col0 + col1) / 2       # ≤1pt 视为居中
+```
+
+**注意**：
+- **目录/图表目录页要排除**（页文本同时含 `....` 和 `图 `）；
+- 位图图（`<pic:pic>`，非 EMF）用 `page.get_image_info()` 的 bbox 补测；
+- 「墨迹包围盒按题注切带」的做法会**假阳性**：EMF 内部框里的文字也被提取成文本行，
+  带状区被压成窄条（本项目曾把 2 张居中良好的图误报偏左 67~70pt）。
+
+### 28.2 校验图表目录页码：页码取「页脚块」，不要取文本行序
+
+```python
+# ✗ 错：以为页码在 get_text() 的最后几行
+for line in reversed(page.get_text().strip().split('\n')[-6:]): ...
+# 页脚块在 PyMuPDF 的块序列里可能排在第 2 位 → 取到正文里的数字，整表误报
+```
+
+```python
+# ✓ 对：按坐标取页脚区域（A4 高 841.9pt）
+for b in page.get_text('blocks'):
+    if b[1] > page.rect.height - 70:          # 底部 70pt 带
+        s = b[4].strip()
+        if s.isdigit():
+            label = int(s); break
+```
+
+**为什么必须校验**：改图尺寸会让页数变化（本项目 204 → 201 页），
+`doc.Fields.Update()` + `TablesOfContents/Figures.Update()` 之后必须**重新导 PDF 逐条比对**
+「目录页码 vs 正文实际页码」。本项目 191 条图表目录条目最终 100% 一致。
+
+**导出 PDF 的正确姿势**：`doc.SaveAs2(pdf_path, 17)`（wdFormatPDF）走**临时副本**，
+`ExportAsFixedFormat` 在某些环境会**静默失败**（不报错、不产文件）。路径必须 `os.path.abspath()`，
+否则 Word 会把相对路径解析到 `C:\Windows\System32\` 下并报 "couldn't find your file"。
