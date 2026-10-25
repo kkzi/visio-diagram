@@ -176,35 +176,61 @@ def _poly_near(pts, x, y):
     return best
 
 
-def _fix_emf_size(path, W, H):
-    """按 **rclBounds** 重写 EMF 的 mm 映射（★ RDP 会话必需；rclBounds 保持原样）。
+def _fix_emf_size(path, W, H, png=None):
+    """重写 EMF 头的图幅声明：**rclBounds 按同源 PNG 补足** + mm 映射按 96 DPI 标定。
 
-    RDP 会话下 Visio 取不到屏幕物理尺寸，EMF 头里 szlMillimeters 退化为 1000×1000，
-    于是 rclFrame（0.01 mm）按**非等比**换算写出 —— 宽高比失真（实测 图 N5 由 0.962 变
-    0.524、图 9-1 由 1.41 变 0.74）。而 **rclBounds（设备像素 = 内容边界）本身始终正确**。
-    排版侧只用 **rclFrame 的宽高比**定图幅，故这里只按 rclBounds 重写
-    rclFrame / szlDevice / szlMillimeters（统一 K px/mm），**绝不改 rclBounds** ——
-    保证图幅宽高比 = 内容宽高比，图不被拉伸。
-    判据：szlDevice 与 szlMillimeters 的宽高比失配（正常会话二者一致）；未命中则原样返回。
+    rclBounds（设备像素 = 内容边界）与 rclFrame / szlMillimeters 一起决定渲染器
+    怎么摆图。两处坑（均实测）：
+
+    1) **rclBounds 比实际导出的位图矮约 9 px（≈2.4 mm）**：`Page.Export` 的裁剪框
+       对文字下缘（字身框 vs 墨迹）估计偏小，同源 PNG 却把字画全了。Word/OLE 按
+       rclBounds 映射 → **贴底那行字被切掉下半截**，而 PNG 预览完整，极易误判成
+       「图源排版被裁」。2026-10-25 在 COMAC 图 11-7 / 14-3 实证。
+       对策：传入同源 PNG 时，用它的像素尺寸把 rclBounds 补足到真实内容范围。
+    2) **rclFrame 的 mm 换算随会话漂移**：RDP 会话 szlMillimeters 退化为 1000×1000
+       （宽高比失真，实测 图 N5 0.962→0.524）；常规会话 DPI 在 96 与 117.3 之间
+       漂移（frame 只有内容的 0.817 倍）→ 超出帧的内容被裁。2026-10-24 在
+       COMAC 图 12-1 实证：frame 110×81 vs 内容 136×100，右侧/底部缺失。
+       对策：rclFrame / szlMillimeters 一律按 **96 DPI** 重写（幂等）。
+
+    ★ 两套判据必须一致：rclFrame ÷ rclBounds 与 szlDevice ÷ szlMillimeters 不同时，
+      Word 取后者 —— 这正是「图形缩在左上角」的成因（实测 14.8 px/mm vs 3.78 px/mm，
+      内容只画到框的 1/4）。本函数保证二者同时正确。
     """
     import struct
-    K = 4.62                    # Visio EMF 导出 px/mm（取自正常会话 szlDevice/szlMillimeters≈4.6295）
+    K = 96 / 25.4              # px/mm @96DPI（内容物理尺寸标定）
     with open(path, "rb") as f:
         buf = bytearray(f.read())
     if len(buf) < 88:
         return
-    dev = struct.unpack_from("<ii", buf, 72)
-    mil = struct.unpack_from("<ii", buf, 80)
-    if dev[0] and dev[1] and mil[0] and mil[1]:
-        dr, mr = dev[0] / float(dev[1]), mil[0] / float(mil[1])
-        if abs(dr - mr) / dr < 0.05:
-            return                      # 正常会话：rclFrame 已正确，不动
-    rb = struct.unpack_from("<iiii", buf, 8)          # rclBounds（内容边界，像素）
+    rb = list(struct.unpack_from("<iiii", buf, 8))    # rclBounds（内容边界，像素）
+    rb_old = tuple(rb)
+    if png and os.path.isfile(png):
+        try:
+            from PIL import Image
+            with Image.open(png) as im:
+                pw, ph = im.size
+            rb[2], rb[3] = rb[0] + pw, rb[1] + ph
+        except Exception:
+            pass
     bw, bh = rb[2] - rb[0], rb[3] - rb[1]
     if bw <= 0 or bh <= 0:
         return
+    rf = struct.unpack_from("<iiii", buf, 24)         # rclFrame（0.01 mm）
+    fw, fh = (rf[2] - rf[0]) / 100.0, (rf[3] - rf[1]) / 100.0
+    dev = struct.unpack_from("<ii", buf, 72)          # szlDevice
+    mil = struct.unpack_from("<ii", buf, 80)          # szlMillimeters
+    tw, th = bw / K, bh / K
+    ok_frame = abs(fw - tw) / tw < 0.02 and abs(fh - th) / th < 0.02
+    ok_dev = (dev == (bw, bh)
+              and abs(mil[0] - tw) <= 1 and abs(mil[1] - th) <= 1)
+    if tuple(rb) == rb_old and ok_frame and ok_dev:
+        return                      # bounds 无需补足、mm 映射与 szlDevice 均已一致 → 幂等跳过
     mmw, mmh = bw / float(K), bh / float(K)
+    struct.pack_into("<iiii", buf, 8, *rb)                                                # rclBounds
     struct.pack_into("<iiii", buf, 24, 0, 0, int(round(mmw * 100)), int(round(mmh * 100)))  # rclFrame
+    # ★ szlDevice 一并写成内容像素尺寸：使 szlDevice÷szlMillimeters == rclBounds÷rclFrame。
+    #   两套判据不一致时 Word 取前者（实测 14.8 vs 3.78 px/mm → 图缩到框的 1/4）。
     struct.pack_into("<ii", buf, 72, bw, bh)                                              # szlDevice
     struct.pack_into("<ii", buf, 80, int(round(mmw)), int(round(mmh)))                     # szlMillimeters
     with open(path, "wb") as f:
@@ -1340,7 +1366,11 @@ class VDraw(object):
         return p
 
     def export(self, path):
-        """按扩展名导出。Page.Export **按内容边界裁剪**（不含页边距），96 DPI。"""
+        """按扩展名导出。Page.Export **按内容边界裁剪**（不含页边距），96 DPI。
+
+        ★ 导出 EMF 时若同源 PNG 已存在，则用它补足 rclBounds（否则贴底文字会被
+          Word 裁掉下半截）。`export_all()` 因此把 PNG 排在 EMF 之前。
+        """
         p = os.path.abspath(path)
         d = os.path.dirname(p)
         if d and not os.path.isdir(d):
@@ -1350,11 +1380,15 @@ class VDraw(object):
         self.reroute()
         self.pg.Export(p)
         if p.lower().endswith(".emf"):
-            _fix_emf_size(p, self.W, self.H)
+            _fix_emf_size(p, self.W, self.H,
+                          png=os.path.splitext(p)[0] + ".png")
         return p
 
     def export_all(self, base, strict=True):
-        """一次导出三件套：base.vsdx / base.emf / base.png。返回**成功**的路径列表。
+        """一次导出三件套：base.vsdx / base.png / base.emf。返回**成功**的路径列表。
+
+        ★ 顺序有意义：PNG 必须早于 EMF —— `_fix_emf_size()` 要用 PNG 的像素尺寸
+          补足 EMF 的 rclBounds（Visio 写的 bounds 比实际位图矮约 9 px）。
 
         ★ 旧版把导出异常吞掉只打印 → 调用方拿不到失败信号，会把「少导出一个」
           当成成功。现改为：三项**都会尝试**，但只要有失败，`strict=True`（默认）
@@ -1364,7 +1398,7 @@ class VDraw(object):
         if base.lower().endswith((".vsdx", ".emf", ".png")):
             base = os.path.splitext(base)[0]
         out, fails = [], []
-        for ext in (".vsdx", ".emf", ".png"):
+        for ext in (".vsdx", ".png", ".emf"):
             try:
                 out.append(self.save(base + ext) if ext == ".vsdx"
                            else self.export(base + ext))

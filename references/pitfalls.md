@@ -1176,3 +1176,55 @@ for b in page.get_text('blocks'):
 **导出 PDF 的正确姿势**：`doc.SaveAs2(pdf_path, 17)`（wdFormatPDF）走**临时副本**，
 `ExportAsFixedFormat` 在某些环境会**静默失败**（不报错、不产文件）。路径必须 `os.path.abspath()`，
 否则 Word 会把相对路径解析到 `C:\Windows\System32\` 下并报 "couldn't find your file"。
+
+## 29. ★★★ 贴底文字被裁 / 图缩在左上角 —— EMF 头三套尺寸必须互相对齐（2026-10-25 实坑，COMAC 17 图）
+
+### 29.1 症状与误判
+
+图里最后一行字（图注、底注、脚注）在 Word / docx 预览里**只剩上半截**，而同源 PNG
+完全正常。很容易误判成「图源排版被裁」去改 Visio 源图 —— **其实图源没问题**。
+
+### 29.2 真因：`Page.Export` 的 rclBounds 比实际位图矮约 9 px
+
+| 量 | 实测值（图 11-7） |
+|---|---|
+| 同源 PNG | 601 × 342 px |
+| EMF `rclBounds` | 600 × **333** px ← 矮 9 px（≈2.4 mm） |
+
+Visio 计算裁剪框时对文字下缘（字身框 vs 墨迹）估计偏小；**位图把字画全了，
+EMF 的 bounds 却少 9 px**。Word/OLE 按 rclBounds 映射 → 贴底那行字的下半截被切。
+
+```python
+# 判据：bounds 高 + 9 ≈ PNG 高（宽度基本一致，差 1 px 属舍入）
+rb = struct.unpack_from("<iiii", buf, 8)
+print(rb[3] - rb[1], Image.open(png).size[1])     # 333 342
+```
+
+**修复**：导出后用同源 PNG 的像素尺寸把 rclBounds 补足（`_fix_emf_size(path, W, H, png=...)`，
+`export_all()` 已把 PNG 排到 EMF **之前**）。源图侧再加一道保险：贴底文字用
+`valign=0`（顶端对齐），别让它正好压在裁剪框边上。
+
+### 29.3 另一半：rclFrame 与 szlMillimeters 必须同标定
+
+渲染器对 EMF 的物理尺寸有两套判据，**不一致时 Word 取 `szlDevice ÷ szlMillimeters`**：
+
+| 来源 | rclBounds ÷ rclFrame | szlDevice ÷ szlMillimeters | 结果 |
+|---|---|---|---|
+| Visio 原始导出 | 3.78 px/mm | 14.8 px/mm（2560/173） | **图缩到对象框的 1/4，贴左上角** |
+| 正确（本库现输出） | 3.78 | 3.78 | 铺满对象框 |
+
+所以 `_fix_emf_size()` 除了写 rclFrame / szlMillimeters，**还要把 szlDevice 写成内容
+像素尺寸**（`struct.pack_into("<ii", buf, 72, bw, bh)`），三者才自洽。
+
+### 29.4 复查清单
+
+1. `bounds == PNG 尺寸`（±1 px）；
+2. `bounds_w / frame_w_mm` 与 `dev_w / mm_w` 相等（±0.05）；
+3. docx 里**图题上方 3 mm** 裁一条 500 dpi 的带看一眼 —— 半截字在 100 dpi 下看不出来；
+4. 与「已知正确」的上一版 PDF 逐图比矢量范围，比值应落在 0.96~1.04。
+
+### 29.5 替换预览图时别按 `imageN` 序号
+
+Word / WPS 重存过的 docx 里，`word/media/imageN.emf` 的编号**与正文出现顺序无关**
+（后插入的图 11-7 是 `image17.emf`，却排在第 10 位）。按序号替换会张冠李戴 ——
+必须按 `document.xml` 里 `w:object` 的顺序取 `rId` → 媒体文件，再用**图题**匹配素材。
