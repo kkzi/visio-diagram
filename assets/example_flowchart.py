@@ -65,11 +65,11 @@ def main(base="out/示例图_流程"):
         # ---- 图例 ----
         d.legend(6, H - 9, W - 12, [("主数据流", None), ("闭环迭代", 4)])
 
-        # ---- 出图 + 自检 ----
+        # ---- 自检 + 出图 ----（先自检后出图，与 SKILL.md 流程一致）
+        d.check()
         print("导出：")
         for p in d.export_all(base):
             print("   ", p)
-        d.check()
     finally:
         d.close()                             # ★ 异常也要收尾，否则残留 VISIO.EXE
 

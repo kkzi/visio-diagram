@@ -89,7 +89,7 @@ python scripts/audit_align.py --add 图表素材/图N8….vsdx    # 登记本次
 改完引擎先跑回归：
 
 ```bash
-python scripts/selftest.py          # 14 项断言
+python scripts/selftest.py          # 19 项断言
 python scripts/doc_consistency.py  # 文档-代码一致性
 ```
 

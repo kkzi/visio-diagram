@@ -121,7 +121,9 @@ def word_check(path):
     """用 Word COM 实测页数 / 表格宽度 / 图片尺寸 / 粗体。返回 (问题列表, 信息)。"""
     import win32com.client as win32
     problems, info = [], {}
-    app = win32.DispatchEx("Word.Application")   # DispatchEx：独立新实例，
+    # ★ 实际栏宽由调用方传入（static_check 已算出）：写死 17.5 会让窄栏文档的溢出表通过审计
+    info["column_cm"] = column_cm if column_cm is not None else 17.5
+def word_check(path, column_cm=None):
     #   不接管用户已打开的 Word（否则 Quit() 会连带关掉用户文档）
     app.Visible = False
     app.DisplayAlerts = 0
@@ -202,7 +204,7 @@ def main():
         print("Word 实测")
         print("-" * 62)
         try:
-            p2, i2 = word_check(a.docx)
+            p2, i2 = word_check(a.docx, column_cm=info.get("column_cm"))
             problems += p2
             print("页数 %d · 段落 %d · 表格 %d"
                   % (i2.get("pages", 0), i2.get("paragraphs", 0), i2.get("tables", 0)))

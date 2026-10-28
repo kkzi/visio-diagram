@@ -89,7 +89,7 @@ python scripts/audit_align.py --add 图表素材/图N8….vsdx    # whitelist re
 Run the regression suite after any engine change:
 
 ```bash
-python scripts/selftest.py          # 14 assertions
+python scripts/selftest.py          # 19 assertions
 python scripts/doc_consistency.py  # docs-vs-code consistency
 ```
 

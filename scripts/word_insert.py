@@ -93,7 +93,7 @@ def insert_at_placeholder(docx, placeholder, image, width_mm=None,
                 break
         if n:
             _quiet(lambda: doc.Fields.Update())
-        _retry(lambda: doc.SaveAs(out))
+            _retry(lambda: doc.SaveAs(out))   # ★ 没插图就不重存：Word 保存会重排 XML（§26 类副作用）
     finally:
         if doc is not None:
             _quiet(lambda: doc.Close(False))

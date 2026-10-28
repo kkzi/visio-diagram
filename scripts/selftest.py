@@ -17,6 +17,7 @@
   I 标签**贴线**（并入）    → 摆在线上方 5mm 的文本框被收进 ~2.3mm（§23）
   J 连线**出线方向**自检    → 目标在右却从左边出线，必须报出     （§24）
   K 合法**绕行**不误报      → 先向左绕再回头接右边，不报          （§24）
+  L EMF 头重写（离线）      → 三套尺寸按 96DPI 对齐、二次运行幂等   （§29）
 
 用法：
     python scripts/selftest.py            # 在临时目录里跑，跑完自动清理
@@ -27,11 +28,13 @@
 import argparse
 import os
 import shutil
+import struct
 import sys
 import tempfile
 import zipfile
 import xml.etree.ElementTree as ET
 
+from PIL import Image
 # ★ Windows 控制台默认 GBK，末行打印 ✅/❌ 会抛 UnicodeEncodeError，
 #   把「全过」的退出码改写成 1（自测假失败）。先切 UTF-8 输出。
 try:
@@ -43,8 +46,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 if HERE not in sys.path:
     sys.path.insert(0, HERE)
 
-from visio_lib import VDraw, LBL_GAP          # noqa: E402
-
+from visio_lib import VDraw, LBL_GAP, _fix_emf_size   # noqa: E402
 NS = "{http://schemas.microsoft.com/office/visio/2012/main}"
 
 
@@ -131,6 +133,36 @@ def main():
                 d.close()
             except Exception:
                 pass
+
+    # L EMF 头重写（离线，§29）：不需要 Visio 也能跑 —— 二进制偏移改错是「图缩在左上角」级灾难
+    emf, pngf = os.path.join(tmp, "t.emf"), os.path.join(tmp, "t.png")
+    Image.new("RGB", (38, 20), "white").save(pngf)
+    buf = bytearray(88)
+    struct.pack_into("<ii", buf, 0, 1, 88)                # iType=EMR_HEADER / nSize
+    struct.pack_into("<iiii", buf, 8, 10, 20, 39, 31)     # rclBounds：故意矮 9px（§29 坑 1）
+    struct.pack_into("<iiii", buf, 24, 0, 0, 8123, 4000)  # rclFrame：故意错（单位 0.01mm）
+    buf[40:44] = b" EMF"                                   # dSignature
+    struct.pack_into("<ii", buf, 72, 640, 480)            # szlDevice：故意错
+    struct.pack_into("<ii", buf, 80, 338, 254)            # szlMillimeters：故意错
+    with open(emf, "wb") as fh:
+        fh.write(buf)
+    _fix_emf_size(emf, png=pngf)
+    with open(emf, "rb") as fh:
+        b2 = bytearray(fh.read())
+    K = 96.0 / 25.4                                        # px/mm @96DPI，与 _fix_emf_size 一致
+    rb2 = struct.unpack_from("<iiii", b2, 8)
+    rf2 = struct.unpack_from("<iiii", b2, 24)
+    dev2 = struct.unpack_from("<ii", b2, 72)
+    mil2 = struct.unpack_from("<ii", b2, 80)
+    check("L EMF 头三套尺寸按 96DPI 对齐",
+          rb2 == (10, 20, 48, 40)
+          and rf2 == (0, 0, int(round(38 / K * 100)), int(round(20 / K * 100)))
+          and dev2 == (38, 20)
+          and mil2 == (int(round(38 / K)), int(round(20 / K))),
+          "rb=%s rf=%s dev=%s mil=%s" % (rb2, rf2, dev2, mil2))
+    _fix_emf_size(emf, png=pngf)
+    with open(emf, "rb") as fh:
+        check("L EMF 重写幂等", fh.read() == bytes(b2), "二次运行仍改动")
 
     try:
         d = VDraw(160, 90, theme="tech-cn")

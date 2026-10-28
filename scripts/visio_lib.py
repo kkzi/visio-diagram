@@ -30,8 +30,10 @@ visio_lib —— 通过 COM 驱动本机 Visio 绘制矢量图。
 import math
 import os
 import re
-import win32com.client as win32
-
+try:
+    import win32com.client as win32
+except ImportError:      # 缺 pywin32 时让 check_env() 能友好报告，而非 import 即崩
+    win32 = None
 import theme as _theme
 
 MARGIN_MM = 0.8          # 图元内文字左右内边距
@@ -138,26 +140,12 @@ def text_extent_mm(text, size_pt, width_mm, font_name="微软雅黑"):
     return lines * (asc + desc) * sc / 96.0 * 25.4, lines
 
 
-def _poly_dist(pts, x, y):
-    """点到折线的最短距离（页面坐标）。"""
-    best = 1e18
-    for i in range(len(pts) - 1):
-        x1, y1 = pts[i]
-        x2, y2 = pts[i + 1]
-        dx, dy = x2 - x1, y2 - y1
-        L2 = dx * dx + dy * dy
-        t = 0.0 if L2 <= 1e-9 else max(0.0, min(1.0, ((x - x1) * dx + (y - y1) * dy) / L2))
-        px, py = x1 + t * dx, y1 + t * dy
-        d = ((x - px) ** 2 + (y - py) ** 2) ** 0.5
-        if d < best:
-            best = d
-    return best
 
 
 def _poly_near(pts, x, y):
     """点到折线的**最近点**信息：返回 `(距离, 段号, 最近点, 段单位方向)`。
 
-    与 `_poly_dist` 同一套投影算法，只把中间量一起返回（页面坐标，Y 向下）。
+    所有点为页面坐标（左上原点、Y 向下）；零长段跳过，无有效段时返回 None。
     段方向用于「标签贴线归一」：文字要落在最近点的法向一侧。
     """
     best = None
@@ -176,7 +164,7 @@ def _poly_near(pts, x, y):
     return best
 
 
-def _fix_emf_size(path, W, H, png=None):
+def _fix_emf_size(path, png=None):
     """重写 EMF 头的图幅声明：**rclBounds 按同源 PNG 补足** + mm 映射按 96 DPI 标定。
 
     rclBounds（设备像素 = 内容边界）与 rclFrame / szlMillimeters 一起决定渲染器
@@ -245,6 +233,8 @@ class VDraw(object):
     """一个 Visio 绘图会话 = 一个页面。"""
     default_auto_merge = True                   # 子类/脚本可改；见 __init__
     def __init__(self, w=300.0, h=170.0, visible=False, theme="tech-cn"):
+        if win32 is None:
+            raise RuntimeError("缺少 pywin32（COM 依赖）：pip install pywin32（可先跑 check_env()）")
         self.W, self.H = float(w), float(h)
         self.t = _theme.get(theme)
         self.font = self.t.font
@@ -257,20 +247,27 @@ class VDraw(object):
             self.app.AlertResponse = 7          # 抑制「是否保存」等弹窗
         except Exception:
             pass
-        self.doc = self.app.Documents.Add("")
-        self.pg = self.doc.Pages.Item(1)
-        self._texts = []
-        self._n_dyn = 0                         # 动态路由连接线计数
-        self._cps = {}                          # (形状ID, 行号) -> (fx, fy)，供出线方向自检
-        self._link_warns = []                   # 连线方向/穿越自检发现的问题
-        self._merged = False                    # merge_texts() 幂等标记
-        self._merged_stat = None
-        # save()/export() 前自动并入文字（可用环境变量 VISIO_MERGE=0 关闭，
-        # 或用类属性 VDraw.default_auto_merge=False 关闭 → 便于出「未合并」对照图）
-        env = os.environ.get("VISIO_MERGE", "")
-        self.auto_merge = (env != "0") if env else VDraw.default_auto_merge
-        self._page(w, h)
-
+        # ★ 构造失败必须 Quit：with 拿不到对象、__exit__ 不会跑 → 残留隐形 VISIO.EXE（pitfalls §7）
+        try:
+            self.doc = self.app.Documents.Add("")
+            self.pg = self.doc.Pages.Item(1)
+            self._texts = []
+            self._n_dyn = 0                         # 动态路由连接线计数
+            self._cps = {}                          # (形状ID, 行号) -> (fx, fy)，供出线方向自检
+            self._link_warns = []                   # 连线方向/穿越自检发现的问题
+            self._merged = False                    # merge_texts() 幂等标记
+            self._merged_stat = None
+            # save()/export() 前自动并入文字（可用环境变量 VISIO_MERGE=0 关闭，
+            # 或用类属性 VDraw.default_auto_merge=False 关闭 → 便于出「未合并」对照图）
+            env = os.environ.get("VISIO_MERGE", "")
+            self.auto_merge = (env != "0") if env else VDraw.default_auto_merge
+            self._page(w, h)
+        except Exception:
+            try:
+                self.app.Quit()
+            except Exception:
+                pass
+            raise
     # ---------------------------------------------------------- 基础
     def _page(self, w, h):
         ps = self.pg.PageSheet
@@ -1223,9 +1220,9 @@ class VDraw(object):
             #   → 图 8-1 的「输出文件复制回本机（回导）」整条丢失。故保持中心判据。
             best, borg, bd, bpts = None, None, None, None
             for ls, pts, org in lines:
-                d = _poly_dist(pts, cx, cy)
-                if bd is None or d < bd:
-                    best, borg, bd, bpts = ls, org, d, pts
+                near = _poly_near(pts, cx, cy)   # 全零长段时返回 None，当未命中处理
+                if near is not None and (bd is None or near[0] < bd):
+                    best, borg, bd, bpts = ls, org, near[0], pts
             if best is None or bd > tol:
                 if os.environ.get("VISIO_MERGE_DEBUG"):
                     print("  [DBG-线标签未命中] %-16s c=(%.2f,%.2f) %.1fx%.1f 最近线距 %.2f (tol %.1f)"
@@ -1290,6 +1287,10 @@ class VDraw(object):
             self._f(best, "VerticalAlign", "1")
             self._f(best, "TxtWidth", "%g mm" % w)
             self._f(best, "TxtHeight", "%g mm" % h)
+            # ★ 带上原框页边距：连接线文本块默认 ~1.27mm/侧 > 原框 0.8mm（§20.3 同源坑），
+            #   不写则可用宽缩水 ~0.9mm，临界宽度的标签并入后可能重排成「一字一行」
+            self._f(best, "LeftMargin", "%g mm" % _num(s, "LeftMargin", MARGIN_MM))
+            self._f(best, "RightMargin", "%g mm" % _num(s, "RightMargin", MARGIN_MM))
             # ★ 1-D 形状的 TxtLocPinX 默认是 `TxtWidth*0`（块左缘贴文本针）→
             #   必须显式设成半宽/半高，块中心才落在 TxtPin 上（否则文字右偏 ~2mm）
             self._f(best, "TxtLocPinX", "%g mm" % (w / 2.0))
@@ -1380,8 +1381,7 @@ class VDraw(object):
         self.reroute()
         self.pg.Export(p)
         if p.lower().endswith(".emf"):
-            _fix_emf_size(p, self.W, self.H,
-                          png=os.path.splitext(p)[0] + ".png")
+            _fix_emf_size(p, png=os.path.splitext(p)[0] + ".png")
         return p
 
     def export_all(self, base, strict=True):

@@ -170,7 +170,7 @@ def _wl_key(path):
 def audit(path, warn=2.0, tol=1.2, dump=False, wl=None):
     wl = wl if wl is not None else _load_wl()
     entries = list(wl.get(_wl_key(path), []))     # 拷贝；命中即弹出，剩下的=已失效
-    boxes, arrows, PW, PH, st = _read(path)
+    boxes, arrows, _, _, st = _read(path)
     n_raw = len(boxes)
     boxes = _drop_lanes(boxes)
 
@@ -251,7 +251,7 @@ def audit(path, warn=2.0, tol=1.2, dump=False, wl=None):
 
 def _collect_new(path, warn, tol):
     """按 audit() 同一套判据收集「待登记」的偏移端点（只读 vsdx，不改白名单）。"""
-    boxes, arrows, PW, PH, st = _read(path)
+    boxes, arrows, _, _, st = _read(path)
     boxes = _drop_lanes(boxes)
     groups = {}
     for b, e in arrows:
@@ -293,12 +293,19 @@ def main():
         n_new = 0
         for p in a.vsdx:
             news = _collect_new(p, a.warn, a.tol)
+            ent = wl.get(_wl_key(p), [])
+            # ★ 先按 (边名, 坐标±WL_TOL) 去重：重复 --add 同一文件会在白名单堆重复条目，
+            #   多余的每条之后都会被报「已失效」（自己造噪音）
+            news = [n for n in news if not any(
+                e.get("side") == n["side"]
+                and abs(e.get("x", 1e9) - n["x"]) <= WL_TOL
+                and abs(e.get("y", 1e9) - n["y"]) <= WL_TOL for e in ent)]
             if news:
                 wl.setdefault(_wl_key(p), []).extend(news)
                 n_new += len(news)
                 print("[--add] %s：登记 %d 条" % (os.path.basename(p), len(news)))
             else:
-                print("[--add] %s：无需登记（本次无偏移端点）" % os.path.basename(p))
+                print("[--add] %s：无需登记（无偏移端点或已在白名单）" % os.path.basename(p))
         if n_new:
             _save_wl(wl)
             print("[--add] 白名单已写入 %s（共 %d 图 / %d 条）"
